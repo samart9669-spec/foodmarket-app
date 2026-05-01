@@ -10,9 +10,17 @@ import google.generativeai as genai
 st.set_page_config(page_title="FoodMarket Data Center", page_icon="🍗", layout="wide")
 st.title("🧾 ระบบรวมข้อมูลยอดขาย FoodMarket (All-in-One)")
 
-# === 1. ช่องใส่ API Key (Sidebar) ===
+# === 1. ระบบจัดการ API Key (ดึงจาก Secrets อัตโนมัติ) ===
 st.sidebar.header("⚙️ ตั้งค่าระบบ")
-api_key = st.sidebar.text_input("🔑 AIzaSyBubtOm29JRRNbs2gF5lRzC1movBHvuzqA:", type="password", help="เอา API Key มาวางตรงนี้เพื่อเริ่มใช้งาน")
+
+# ตรวจสอบว่ามี Key ใน Secrets หรือไม่ (เพื่อความปลอดภัยและสะดวกบน iPad)
+if "GEMINI_API_KEY" in st.secrets:
+    api_key = st.secrets["GEMINI_API_KEY"]
+    st.sidebar.success("✅ เชื่อมต่อ API Key จากระบบ Secrets แล้ว")
+else:
+    # ถ้าไม่มีใน Secrets จะแสดงช่องให้กรอกเอง
+    api_key = st.sidebar.text_input("🔑 ใส่ Gemini API Key:", type="password", help="กรอก API Key เพื่อเริ่มใช้งาน")
+    st.sidebar.info("💡 แนะนำให้ตั้งค่าใน Streamlit Cloud Secrets เพื่อไม่ต้องกรอกใหม่ทุกครั้ง")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 📅 เลือกวันที่ (Date Filter)")
@@ -36,7 +44,7 @@ else:
     st.sidebar.error("❌ หาไฟล์ item_master.json ไม่เจอ")
 
 # ========================================================
-# 🔒 ตั้งค่าชื่อคอลัมน์ให้ตรงกับไฟล์ระบบ POS ของคุณ
+# 🔒 ชื่อคอลัมน์มาตรฐานสำหรับไฟล์ CSV จาก POS
 # ========================================================
 CSV_COL_DATE = "วันที่เปิดบิล"
 CSV_COL_CODE = "รหัสเมนู"
@@ -99,15 +107,13 @@ uploaded_files = st.file_uploader("ลากไฟล์รูปภาพแล
 
 if st.button("🚀 ประมวลผลข้อมูลทั้งหมด", type="primary", use_container_width=True):
     if not api_key:
-        st.error("⚠️ กรุณาใส่ API Key ที่เมนูด้านซ้ายมือก่อนครับ")
+        st.error("⚠️ กรุณาใส่ API Key ในช่องด้านซ้ายมือ หรือตั้งค่าใน Secrets ก่อนครับ")
     elif not uploaded_files:
         st.warning("⚠️ กรุณาอัปโหลดไฟล์ก่อนครับ")
     else:
         genai.configure(api_key=api_key)
         
-        # ========================================================
-        # 🔴 ล็อคโมเดลเป็น gemini-2.5-flash ไว้ตรงนี้เลยครับ!
-        # ========================================================
+        # ล็อคโมเดลเป็น gemini-2.5-flash
         model = genai.GenerativeModel("gemini-2.5-flash") 
         
         prompt = """
@@ -133,7 +139,6 @@ if st.button("🚀 ประมวลผลข้อมูลทั้งหม�
             file_ext = file.name.lower().split('.')[-1]
             status_text.text(f"กำลังประมวลผลไฟล์ที่ {i+1}/{len(uploaded_files)}: {file.name} ...")
             
-            # --- กรณีไฟล์รูปภาพ (ให้ AI อ่าน) ---
             if file_ext in ['jpg', 'jpeg', 'png']:
                 col1, col2 = st.columns([1, 2])
                 image = Image.open(file)
@@ -162,7 +167,6 @@ if st.button("🚀 ประมวลผลข้อมูลทั้งหม�
                 if images_processed < image_count:
                     time.sleep(10)
                     
-            # --- กรณีไฟล์ CSV (แพนด้าอ่าน และกรองวันที่) ---
             elif file_ext == 'csv':
                 try:
                     try: 
@@ -171,11 +175,9 @@ if st.button("🚀 ประมวลผลข้อมูลทั้งหม�
                         file.seek(0)
                         raw_df = pd.read_csv(file, encoding='tis-620')
                         
-                    missing_cols = [c for c in [CSV_COL_CODE, CSV_COL_QTY, CSV_COL_AMOUNT] if c not in raw_df.columns]
-                    if missing_cols:
-                        st.error(f"❌ ไฟล์ {file.name} ขาดคอลัมน์: {', '.join(missing_cols)}")
+                    if [c for c in [CSV_COL_CODE, CSV_COL_QTY, CSV_COL_AMOUNT] if c not in raw_df.columns]:
+                        st.error(f"❌ ไฟล์ {file.name} มีชื่อคอลัมน์ไม่ตรงกับระบบ")
                     else:
-                        # กรองเอาเฉพาะข้อมูลที่มีวันที่ตรงกับที่เราเลือกจากเมนูด้านซ้าย
                         if CSV_COL_DATE in raw_df.columns:
                             parsed_dates = pd.to_datetime(raw_df[CSV_COL_DATE], errors='coerce', dayfirst=True).dt.date
                             filtered_df = raw_df[parsed_dates == selected_date]
@@ -183,42 +185,35 @@ if st.button("🚀 ประมวลผลข้อมูลทั้งหม�
                             filtered_df = raw_df 
                             
                         if filtered_df.empty:
-                            st.warning(f"⚠️ ไฟล์ {file.name} ไม่มียอดขายของวันที่ {formatted_selected_date} เลยครับ (ข้ามไฟล์นี้)")
+                            st.warning(f"⚠️ ไม่พบยอดขายวันที่ {formatted_selected_date} ใน {file.name}")
                             continue
 
                         valid_rows = 0
                         for index, row in filtered_df.iterrows():
-                            r_name = row[CSV_COL_NAME] if CSV_COL_NAME in filtered_df.columns else ""
-                            
                             processed_row = process_row_data(
-                                formatted_selected_date, row[CSV_COL_CODE], r_name, 
+                                formatted_selected_date, row[CSV_COL_CODE], row[CSV_COL_NAME], 
                                 row[CSV_COL_QTY], row[CSV_COL_AMOUNT], file.name
                             )
                             if processed_row: 
                                 all_data.append(processed_row)
                                 valid_rows += 1
-                        st.success(f"✅ ดึงข้อมูล CSV {file.name} (เฉพาะวันที่ {formatted_selected_date}) สำเร็จ {valid_rows} รายการ")
+                        st.success(f"✅ ดึงข้อมูล CSV {file.name} สำเร็จ {valid_rows} รายการ")
                 except Exception as e:
-                    st.error(f"❌ อ่านไฟล์ CSV {file.name} ไม่สำเร็จ: {e}")
+                    st.error(f"❌ อ่านไฟล์ CSV {file.name} ไม่สำเร็จ")
             
             progress_bar.progress((i + 1) / len(uploaded_files))
             
-        status_text.success("✅ ประมวลผลข้อมูลทั้งหมดเสร็จสิ้น!")
-        
-        # === 4. แสดงผลตาราง ===
         if all_data:
             st.markdown("---")
-            st.markdown("### 📊 ผลลัพธ์ข้อมูลรวม (พร้อมนำไปวางใน Excel)")
+            st.markdown("### 📊 ผลลัพธ์ข้อมูลรวม")
             df = pd.DataFrame(all_data)
-            
             df = df[["วันที่", "สาขา", "รหัสสินค้า", "ชื่อเมนู", "ราคา (฿)", "จำนวน (จาน)", "ยอด (฿)", "แหล่งที่มา"]]
-            
             st.dataframe(df, use_container_width=True)
             
             csv = df.to_csv(index=False).encode('utf-8-sig')
             st.download_button(
-                label="📥 ดาวน์โหลดไฟล์ CSV (ตารางรวม)",
+                label="📥 ดาวน์โหลดไฟล์ CSV รวมยอด",
                 data=csv,
-                file_name=f'foodmarket_merged_data_{selected_date.strftime("%Y%m%d")}.csv',
+                file_name=f'foodmarket_merged_{selected_date.strftime("%Y%m%d")}.csv',
                 mime='text/csv',
             )
