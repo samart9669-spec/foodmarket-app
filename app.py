@@ -3,28 +3,88 @@ import pandas as pd
 import json
 import time
 import datetime
+import os
 from PIL import Image
 import google.generativeai as genai
 
+# ========================================================
+# 📊 ตั้งค่าโควตาด้วยตัวเอง (Manual Quota Settings)
+# ========================================================
+# ปรับตัวเลขตามที่คุณเจอในหน้า Google AI Studio ได้เลยครับ
+QUOTA_LIMITS = {
+    "gemini-2.5-flash": 20,
+    "gemini-2.5-flash-lite": 20,
+    "gemini-2.0-flash": 20  # เผื่อคุณสลับไปใช้รุ่นที่โควตาเยอะกว่า
+}
+
+USAGE_FILE = "usage_log.json"
+# ========================================================
+
 # === การตั้งค่าหน้าเว็บ ===
 st.set_page_config(page_title="FoodMarket Data Center", page_icon="🍗", layout="wide")
-st.title("🧾 ระบบรวมข้อมูลยอดขาย FoodMarket (All-in-One)")
+st.title("🧾 ระบบรวมข้อมูลยอดขาย (Usage Tracker v2)")
 
-# === 1. ระบบจัดการ API Key (ดึงจาก Secrets อัตโนมัติ) ===
+# --- ระบบนับจำนวนการใช้งาน (Usage Tracker) ---
+def load_usage():
+    today = str(datetime.date.today())
+    if os.path.exists(USAGE_FILE):
+        try:
+            with open(USAGE_FILE, "r") as f:
+                data = json.load(f)
+                if data.get("date") == today:
+                    return data.get("counts", {})
+        except: return {}
+    return {}
+
+def update_usage(model_name):
+    today = str(datetime.date.today())
+    usage_data = load_usage()
+    usage_data[model_name] = usage_data.get(model_name, 0) + 1
+    with open(USAGE_FILE, "w") as f:
+        json.dump({"date": today, "counts": usage_data}, f)
+    return usage_data[model_name]
+
+# โหลดข้อมูลปัจจุบัน
+current_counts = load_usage()
+
+# === 1. ระบบจัดการ API Key & Model Selection ===
 st.sidebar.header("⚙️ ตั้งค่าระบบ")
 
-# ตรวจสอบว่ามี Key ใน Secrets หรือไม่ (เพื่อความปลอดภัยและสะดวกบน iPad)
 if "GEMINI_API_KEY" in st.secrets:
     api_key = st.secrets["GEMINI_API_KEY"]
-    st.sidebar.success("✅ เชื่อมต่อ API Key จากระบบ Secrets แล้ว")
+    st.sidebar.success("✅ เชื่อมต่อ Key จาก Secrets")
 else:
-    # ถ้าไม่มีใน Secrets จะแสดงช่องให้กรอกเอง
-    api_key = st.sidebar.text_input("🔑 ใส่ Gemini API Key:", type="password", help="กรอก API Key เพื่อเริ่มใช้งาน")
-    st.sidebar.info("💡 แนะนำให้ตั้งค่าใน Streamlit Cloud Secrets เพื่อไม่ต้องกรอกใหม่ทุกครั้ง")
+    api_key = st.sidebar.text_input("🔑 ใส่ Gemini API Key:", type="password")
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("### 📅 เลือกวันที่ (Date Filter)")
-st.sidebar.caption("• **สลิปรูปภาพ:** ใช้วันที่นี้แทน กรณี AI หาวันที่บนสลิปไม่เจอ\n• **ไฟล์ CSV:** ระบบจะดึงยอดขายมาเฉพาะวันที่ตรงกับช่องนี้เท่านั้น")
+st.sidebar.divider()
+
+# --- เมนูเลือกโมเดลและแสดงตัวนับ ---
+st.sidebar.subheader("🤖 สถานะโควตาใช้งานวันนี้")
+model_choice = st.sidebar.selectbox(
+    "เลือกโมเดล:",
+    list(QUOTA_LIMITS.keys()),
+    index=1
+)
+
+# ดึงค่า Max Quota จากตัวแปรที่เราตั้งไว้ด้านบน
+max_q = QUOTA_LIMITS.get(model_choice, 20)
+used_q = current_counts.get(model_choice, 0)
+
+# แสดงผล Metric
+st.sidebar.metric(
+    label=f"โควตา {model_choice}",
+    value=f"{used_q} / {max_q}",
+    delta=f"เหลือ {max_q - used_q} ครั้ง",
+    delta_color="normal" if used_q < max_q else "inverse"
+)
+
+# Progress Bar แสดงความคุ้มค่า
+st.sidebar.progress(min(used_q / max_q, 1.0))
+
+if used_q >= max_q:
+    st.sidebar.error("⚠️ โควตาวันนี้เต็มแล้ว! แนะนำให้เปลี่ยนรุ่นหรือรอพรุ่งนี้ครับ")
+
+st.sidebar.divider()
 selected_date = st.sidebar.date_input("เลือกวันที่ขาย:", datetime.date.today())
 formatted_selected_date = selected_date.strftime("%d/%m/%Y")
 
@@ -34,186 +94,99 @@ def load_master():
     try:
         with open('item_master.json', 'r', encoding='utf-8') as f:
             return json.load(f)
-    except Exception:
-        return {}
-
+    except: return {}
 item_master = load_master()
-if len(item_master) > 0:
-    st.sidebar.success(f"✅ โหลด Master Data สำเร็จ ({len(item_master)} รายการ)")
-else:
-    st.sidebar.error("❌ หาไฟล์ item_master.json ไม่เจอ")
 
-# ========================================================
-# 🔒 ชื่อคอลัมน์มาตรฐานสำหรับไฟล์ CSV จาก POS
-# ========================================================
-CSV_COL_DATE = "วันที่เปิดบิล"
-CSV_COL_CODE = "รหัสเมนู"
-CSV_COL_NAME = "ชื่อเมนู"
-CSV_COL_QTY = "จำนวน"
-CSV_COL_AMOUNT = "ยอดขาย"
+# === 3. ส่วนประมวลผลข้อมูล ===
+COL_TOTAL = "ยอด (฿)"
 
-# === ฟังก์ชันทำความสะอาดตัวเลข ===
-def clean_number(val):
-    if pd.isna(val) or val == "" or val == "ไม่ระบุ": return 0
-    if isinstance(val, str): val = val.replace(",", "").strip()
-    try: return float(val)
-    except: return 0
-
-# === ฟังก์ชันจัดรูปแบบข้อมูล ===
 def process_row_data(raw_date, raw_code, raw_name, raw_qty, raw_amount, source_file):
-    qty = clean_number(raw_qty)
-    amount = clean_number(raw_amount)
+    def clean(v):
+        if pd.isna(v) or v == "": return 0
+        try: return float(str(v).replace(",", ""))
+        except: return 0
+    
+    qty, amount = clean(raw_qty), clean(raw_amount)
     if qty == 0 and amount == 0: return None
     
-    # ถ้าหา Date ไม่เจอจริงๆ ค่อยใช้วันที่ที่เลือก
-    final_date = str(raw_date).strip() if str(raw_date).strip() not in ["", "nan", "NaN", "None"] else formatted_selected_date
-    code_raw = str(raw_code).strip().upper().replace("FMFCO", "FMFC0").replace("FMC0", "FMFC0")
-    original_name = str(raw_name).strip()
+    code = str(raw_code).strip().upper().replace("FMFCO", "FMFC0").replace("FMC0", "FMFC0")
+    name, branch = str(raw_name).strip(), "ไม่ระบุสาขา"
     
-    correct_name = original_name
-    branch_name = "ไม่ระบุสาขา"
-    
-    found_in_master = False
-    for key, val in item_master.items():
-        if "|" in key:
-            master_branch, master_code = key.split("|", 1)
-            if master_code == code_raw:
-                correct_name = val
-                branch_name = master_branch
-                found_in_master = True
+    for k, v in item_master.items():
+        if "|" in k:
+            b, c = k.split("|", 1)
+            if c == code:
+                name, branch = v, b
                 break
-                
-    if not found_in_master and code_raw in item_master:
-        correct_name = item_master[code_raw]
-        
-    unit_price = amount / qty if qty > 0 else 0
     
     return {
-        "วันที่": final_date,
-        "สาขา": branch_name,
-        "รหัสสินค้า": code_raw,
-        "ชื่อเมนู": correct_name,
-        "ราคา (฿)": round(unit_price, 2),
-        "จำนวน (จาน)": int(qty),
-        "ยอด (฿)": amount,
-        "แหล่งที่มา": source_file
+        "วันที่": str(raw_date) if raw_date else formatted_selected_date,
+        "สาขา": branch, "รหัสสินค้า": code, "ชื่อเมนู": name,
+        "ราคา (฿)": round(amount/qty, 2) if qty > 0 else 0,
+        "จำนวน (จาน)": int(qty), COL_TOTAL: amount, "แหล่งที่มา": source_file
     }
 
-# === 3. ส่วนอัปโหลดแบบรวมมิตร ===
-st.markdown("### 📤 อัปโหลดไฟล์ทั้งหมด (ภาพสลิป และ CSV)")
-st.info(f"💡 ระบบทำงานด้วย AI โมเดล **Gemini 2.5 Flash** | 💡 สำหรับ CSV ดึงเฉพาะวันที่ **{formatted_selected_date}**")
+# === 4. หน้าจอหลัก ===
+st.info(f"🚀 Engine: **{model_choice}** | 📅 วันที่: **{formatted_selected_date}**")
+uploaded_files = st.file_uploader("อัปโหลดไฟล์สลิปหรือ CSV", type=['jpg', 'jpeg', 'png', 'csv'], accept_multiple_files=True)
 
-uploaded_files = st.file_uploader("ลากไฟล์รูปภาพและ CSV มารวมกันตรงนี้ได้เลย", type=['jpg', 'jpeg', 'png', 'csv'], accept_multiple_files=True)
-
-if st.button("🚀 ประมวลผลข้อมูลทั้งหมด", type="primary", use_container_width=True):
+if st.button("🚀 ประมวลผลข้อมูล", type="primary", use_container_width=True):
     if not api_key:
-        st.error("⚠️ กรุณาใส่ API Key ในช่องด้านซ้ายมือ หรือตั้งค่าใน Secrets ก่อนครับ")
+        st.error("🚨 กรุณากรอก API Key")
+    elif used_q >= max_q:
+        st.error(f"🚨 ไม่สามารถทำงานได้เนื่องจากโควตา {model_choice} ของคุณเต็มแล้ว")
     elif not uploaded_files:
-        st.warning("⚠️ กรุณาอัปโหลดไฟล์ก่อนครับ")
+        st.warning("ℹ️ กรุณาอัปโหลดไฟล์")
     else:
         genai.configure(api_key=api_key)
-        
-        # ล็อคโมเดลเป็น gemini-2.5-flash
-        model = genai.GenerativeModel("gemini-2.5-flash") 
-        
-        prompt = """
-        คุณคือพนักงานบัญชี ดึงข้อมูล 'วันที่' และ 'รายการยอดขาย' จากรูปภาพใบเสร็จนี้ 
-        ให้ส่งกลับมาเป็นรูปแบบ JSON Array เท่านั้น ตามโครงสร้างนี้:
-        [{"Date": "DD/MM/YYYY", "Item_Code": "รหัสเมนู", "Item_Name": "ชื่อเมนู", "Qty": จำนวน, "Amount": ยอดเงินรวม}]
-        เงื่อนไข:
-        1. Date: หา "วันที่" ในสลิป แปลงเป็น วัน/เดือน/ปี ถ้าหาไม่พบให้เว้นว่างเป็น "" ให้ใส่ในทุกบรรทัด
-        2. ข้ามบรรทัดที่ไม่ใช่เมนูอาหาร ห้ามอธิบายเพิ่ม ตอบแค่ JSON เท่านั้น
-        """
+        model = genai.GenerativeModel(model_choice)
         
         all_data = []
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        st.markdown("---")
-        st.markdown("### 🔄 สถานะการประมวลผล")
-        
-        image_count = sum(1 for f in uploaded_files if f.name.lower().endswith(('.jpg', '.jpeg', '.png')))
-        images_processed = 0
+        progress = st.progress(0)
+        status = st.empty()
         
         for i, file in enumerate(uploaded_files):
-            file_ext = file.name.lower().split('.')[-1]
-            status_text.text(f"กำลังประมวลผลไฟล์ที่ {i+1}/{len(uploaded_files)}: {file.name} ...")
+            ext = file.name.lower().split('.')[-1]
+            status.text(f"กำลังจัดการ: {file.name}")
             
-            if file_ext in ['jpg', 'jpeg', 'png']:
-                col1, col2 = st.columns([1, 2])
-                image = Image.open(file)
-                with col1: st.image(image, width=200)
-                
+            if ext in ['jpg', 'jpeg', 'png']:
                 try:
-                    response = model.generate_content([prompt, image])
-                    clean_text = response.text.strip()
-                    if clean_text.startswith("```json"): clean_text = clean_text[7:]
-                    if clean_text.endswith("```"): clean_text = clean_text[:-3]
+                    img = Image.open(file)
+                    prompt = "Extract sales to JSON: [{'Date':'DD/MM/YYYY', 'Item_Code':'str', 'Item_Name':'str', 'Qty':int, 'Amount':float}]"
+                    response = model.generate_content([prompt, img])
                     
-                    data_list = json.loads(clean_text)
-                    with col2: st.success(f"✅ สแกนสลิปสำเร็จ พบ {len(data_list)} รายการ")
+                    # บันทึกการใช้งานลงไฟล์ทันทีที่ AI ตอบกลับสำเร็จ[cite: 1]
+                    update_usage(model_choice)
                     
-                    for row in data_list:
-                        processed_row = process_row_data(
-                            row.get("Date", ""), row.get("Item_Code", ""), row.get("Item_Name", ""),
-                            row.get("Qty", 0), row.get("Amount", 0.0), file.name
-                        )
-                        if processed_row: all_data.append(processed_row)
-                        
+                    raw_txt = response.text.replace("```json", "").replace("```", "").strip()
+                    for item in json.loads(raw_txt):
+                        res = process_row_data(item.get("Date"), item.get("Item_Code"), item.get("Item_Name"), item.get("Qty"), item.get("Amount"), file.name)
+                        if res: all_data.append(res)
+                    time.sleep(4) 
                 except Exception as e:
-                    with col2: st.error(f"❌ อ่านภาพ {file.name} ไม่สำเร็จ: ({e})")
-                
-                images_processed += 1
-                if images_processed < image_count:
-                    time.sleep(10)
-                    
-            elif file_ext == 'csv':
+                    st.error(f"❌ {file.name} ล้มเหลว: {e}")
+            
+            elif ext == 'csv':
+                # จัดการ CSV ตามปกติ (ไม่นับโควตา AI)[cite: 1]
                 try:
-                    try: 
-                        raw_df = pd.read_csv(file, encoding='utf-8')
-                    except UnicodeDecodeError:
-                        file.seek(0)
-                        raw_df = pd.read_csv(file, encoding='tis-620')
-                        
-                    if [c for c in [CSV_COL_CODE, CSV_COL_QTY, CSV_COL_AMOUNT] if c not in raw_df.columns]:
-                        st.error(f"❌ ไฟล์ {file.name} มีชื่อคอลัมน์ไม่ตรงกับระบบ")
-                    else:
-                        if CSV_COL_DATE in raw_df.columns:
-                            parsed_dates = pd.to_datetime(raw_df[CSV_COL_DATE], errors='coerce', dayfirst=True).dt.date
-                            filtered_df = raw_df[parsed_dates == selected_date]
-                        else:
-                            filtered_df = raw_df 
-                            
-                        if filtered_df.empty:
-                            st.warning(f"⚠️ ไม่พบยอดขายวันที่ {formatted_selected_date} ใน {file.name}")
-                            continue
+                    df_csv = pd.read_csv(file, encoding='utf-8-sig')
+                    for _, r in df_csv.iterrows():
+                        res = process_row_data(formatted_selected_date, r.get("รหัสเมนู"), r.get("ชื่อเมนู"), r.get("จำนวน"), r.get("ยอดขาย"), file.name)
+                        if res: all_data.append(res)
+                except: st.error(f"❌ อ่าน CSV {file.name} ไม่ได้")
+            
+            progress.progress((i + 1) / len(uploaded_files))
 
-                        valid_rows = 0
-                        for index, row in filtered_df.iterrows():
-                            processed_row = process_row_data(
-                                formatted_selected_date, row[CSV_COL_CODE], row[CSV_COL_NAME], 
-                                row[CSV_COL_QTY], row[CSV_COL_AMOUNT], file.name
-                            )
-                            if processed_row: 
-                                all_data.append(processed_row)
-                                valid_rows += 1
-                        st.success(f"✅ ดึงข้อมูล CSV {file.name} สำเร็จ {valid_rows} รายการ")
-                except Exception as e:
-                    st.error(f"❌ อ่านไฟล์ CSV {file.name} ไม่สำเร็จ")
-            
-            progress_bar.progress((i + 1) / len(uploaded_files))
-            
         if all_data:
-            st.markdown("---")
-            st.markdown("### 📊 ผลลัพธ์ข้อมูลรวม")
-            df = pd.DataFrame(all_data)
-            df = df[["วันที่", "สาขา", "รหัสสินค้า", "ชื่อเมนู", "ราคา (฿)", "จำนวน (จาน)", "ยอด (฿)", "แหล่งที่มา"]]
-            st.dataframe(df, use_container_width=True)
+            st.success(f"✅ ประมวลผลสำเร็จ! พบข้อมูล {len(all_data)} รายการ")
+            df_final = pd.DataFrame(all_data)
+            st.dataframe(df_final, use_container_width=True)
             
-            csv = df.to_csv(index=False).encode('utf-8-sig')
-            st.download_button(
-                label="📥 ดาวน์โหลดไฟล์ CSV รวมยอด",
-                data=csv,
-                file_name=f'foodmarket_merged_{selected_date.strftime("%Y%m%d")}.csv',
-                mime='text/csv',
-            )
+            # กราฟสรุปยอดขาย (ป้องกัน Error ชื่อคอลัมน์)[cite: 1]
+            if COL_TOTAL in df_final.columns:
+                st.bar_chart(df_final.groupby("สาขา")[COL_TOTAL].sum())
+            
+            st.download_button("📥 ดาวน์โหลดรายงาน", df_final.to_csv(index=False).encode('utf-8-sig'), f"Summary_{formatted_selected_date}.csv")
+            
+            # สั่งรีเฟรชเพื่อให้ตัวนับใน Sidebar อัปเดตล่าสุด
+            st.rerun()
